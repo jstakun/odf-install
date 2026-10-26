@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-cephfs-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ocs-storagecluster-cephfs
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-cephfs-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: registry.redhat.io/ubi9/ubi-minimal:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Writing test data to CephFS..."
+          echo "ODF Verification - CephFS on odf-network: $(date)" > /mnt/cephfs/test.txt
+          sync
+          echo "Reading test data back:"
+          cat /mnt/cephfs/test.txt
+          echo "CEPHFS TEST SUCCESS"
+      volumeMounts:
+        - mountPath: /mnt/cephfs
+          name: cephfs-vol
+  volumes:
+    - name: cephfs-vol
+      persistentVolumeClaim:
+        claimName: test-cephfs-pvc

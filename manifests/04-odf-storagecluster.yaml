@@ -1,0 +1,85 @@
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+  annotations:
+    cluster.ocs.openshift.io/local-devices: "true"
+spec:
+  manageNodes: false
+  monDataDirHostPath: /var/lib/rook
+  network:
+    provider: multus
+    selectors:
+      cluster: openshift-storage/odf-network
+    addressRanges:
+      cluster:
+        - 10.200.0.0/24
+      public:
+        - 10.128.0.0/14
+  storageDeviceSets:
+    - name: ocs-deviceset
+      count: 1
+      replica: 3
+      dataPVCTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Gi
+          storageClassName: odf-local-storage
+          volumeMode: Block
+      placement:
+        nodeAffinity:
+          matchExpressions:
+            - key: cluster.ocs.openshift.io/openshift-storage
+              operator: In
+              values:
+                - ""
+        tolerations:
+          - key: "node-role.kubernetes.io/master"
+            operator: "Exists"
+            effect: "NoSchedule"
+          - key: "node-role.kubernetes.io/control-plane"
+            operator: "Exists"
+            effect: "NoSchedule"
+  resources:
+    mds:
+      requests:
+        cpu: 250m
+        memory: 2Gi
+    mgr:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+    mon:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+    osd:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+  managedResources:
+    cephBlockPools: {}
+    cephCluster: {}
+    cephDashboard: {}
+    cephFilesystems: {}
+    cephNonResilientPools: {}
+    cephObjectStoreUsers: {}
+    cephObjectStores: {}
+    cephRBDMirror: {}
+    cephToolbox: {}
+  multiCloudGateway:
+    reconcileStrategy: manage
+    dbStorageClassName: gp3-csi
+  placement:
+    all:
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
