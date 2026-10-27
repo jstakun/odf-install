@@ -61,6 +61,24 @@ for cr in noobaa backingstore bucketclass; do
   done
 done
 
+# Remove finalizers on dependent Ceph and CSI-Addons resources
+for crd in clientprofiles.csi.ceph.io csiaddonsnodes.csiaddons.openshift.io storageconsumers.ocs.openshift.io cephblockpools.ceph.rook.io cephfilesystems.ceph.rook.io cephblockpoolradosnamespaces.ceph.rook.io cephfilesystemsubvolumegroups.ceph.rook.io cephclients.ceph.rook.io; do
+  for item in $(oc get "$crd" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+    oc patch "$crd" "$item" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+    oc delete "$crd" "$item" -n openshift-storage --wait=false 2>/dev/null || true
+  done
+done
+
+# Strip lingering finalizers on storage configmaps and secrets
+for res in configmaps secrets; do
+  for item in $(oc get "$res" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+    oc patch "$res" "$item" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  done
+done
+
+# Delete ODF storage classes
+oc delete sc ocs-storagecluster-ceph-rbd ocs-storagecluster-cephfs --ignore-not-found 2>/dev/null || true
+
 echo "=== 2. Deleting ODF Operator ==="
 oc delete subscription odf-operator -n openshift-storage 2>/dev/null || true
 for csv in $(oc get csv -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
