@@ -87,7 +87,8 @@ This repository contains the architecture, step-by-step procedures, helper scrip
 │   └── 06-test-pvc-cephfs.yaml       # CephFS test PVC (RWX) and consumer Pod
 └── scripts/
     ├── prepare-aws-infrastructure.sh # AWS CLI automation for EBS volumes & node labeling
-    └── verify-odf.sh                 # End-to-end health check and validation script
+    ├── verify-odf.sh                 # End-to-end health check and validation script
+    └── uninstall-odf.sh              # Teardown and disk wipe automation for clean reinstall
 ```
 
 ---
@@ -268,3 +269,165 @@ CEPHFS TEST SUCCESS
 | `ocs-storagecluster-cephfs` | `openshift-storage.cephfs.csi.ceph.com` | Filesystem | ReadWriteMany, ReadWriteOnce | Ceph Shared Filesystem for multi-pod access |
 | `odf-local-storage` | `kubernetes.io/no-provisioner` | Block | ReadWriteOnce | Underlying 100 GB raw EBS volumes provisioned by LSO |
 | `gp3-csi` | `ebs.csi.aws.com` | Filesystem | ReadWriteOnce | AWS EBS backing NooBaa Multi-Cloud Gateway PostgreSQL |
+
+---
+
+## 6. ODF Uninstallation & Reinstallation Guide
+
+If you need to redeploy ODF from scratch, simply deleting the `StorageCluster` or uninstalling the operators is **insufficient**. Reinstallation requires a complete teardown and disk/node wipe:
+
+> [!CAUTION]
+> **Why Node and Disk Wiping is Mandatory Before Reinstalling:**
+> 1. **BlueStore Signatures on EBS Disks**: Ceph writes metadata and signatures to raw block devices (`/dev/nvme1n1`). If not wiped with `wipefs` and `dd`, Local Storage Operator and Rook will detect existing filesystem/partition signatures and refuse to provision PVs or OSDs on them.
+> 2. **Monitor State in `/var/lib/rook`**: Host nodes retain Ceph monitor maps, keys, and old cluster FSIDs in `/var/lib/rook`. If this directory is not deleted, newly deployed MONs will attempt to join the old non-existent cluster and fail quorum.
+> 3. **Kubernetes Finalizers**: Resources such as `StorageCluster`, `CephCluster`, and `NooBaa` often block namespace deletion if daemons are terminated unexpectedly.
+
+---
+
+### Option A: Automated Teardown & Wipe
+
+Run the automated uninstallation script ([`scripts/uninstall-odf.sh`](file:///home/jstakun/git/odf-install/scripts/uninstall-odf.sh)):
+
+```bash
+./scripts/uninstall-odf.sh
+```
+
+To run unattended without an interactive confirmation prompt:
+```bash
+./scripts/uninstall-odf.sh --force
+```
+
+This script automatically:
+1. Deletes `StorageCluster`, `CephCluster`, and NooBaa resources (clearing any stuck finalizers).
+2. Deletes the ODF operator, CSVs, and OperatorGroup in `openshift-storage`.
+3. Deletes `LocalVolumeSet`, local PersistentVolumes, and the Local Storage Operator in `openshift-local-storage`.
+4. Spawns debug sessions on each storage node to safely wipe `/dev/nvme1n1` (`sgdisk --zap-all`, `wipefs -a -f`, zeroing the first 100 MB) and removes `/var/lib/rook/*`.
+5. Removes the `openshift-storage` and `openshift-local-storage` namespaces.
+
+---
+
+### Option B: Step-by-Step Manual Teardown & Wipe
+
+If you prefer to perform each step manually:
+
+#### 1. Delete Application PVCs
+Ensure no consumer workloads or PVCs in user namespaces are using `ocs-storagecluster-ceph-rbd` or `ocs-storagecluster-cephfs`:
+```bash
+oc delete pvc test-rbd-pvc test-cephfs-pvc -n default --ignore-not-found
+```
+
+#### 2. Delete StorageCluster and Ceph Resources
+```bash
+oc delete storagecluster ocs-storagecluster -n openshift-storage --wait=false
+```
+
+If the deletion gets stuck on finalizers:
+```bash
+# Patch StorageCluster finalizer
+oc patch storagecluster ocs-storagecluster -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]'
+
+# Patch CephCluster finalizer if present
+oc patch cephcluster ocs-storagecluster-cephcluster -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]'
+
+# Patch NooBaa finalizers if present
+for cr in noobaa backingstore bucketclass; do
+  for res in $(oc get "$cr" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+    oc patch "$cr" "$res" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  done
+done
+```
+
+#### 3. Uninstall ODF Operator
+```bash
+oc delete subscription odf-operator -n openshift-storage
+for csv in $(oc get csv -n openshift-storage -o jsonpath='{.items[*].metadata.name}'); do
+  oc delete csv "$csv" -n openshift-storage
+done
+oc delete operatorgroup openshift-storage-operatorgroup -n openshift-storage
+```
+
+#### 4. Delete LocalVolumeSet & Local PVs
+```bash
+oc delete localvolumeset odf-localvolumeset -n openshift-local-storage --wait=false
+oc patch localvolumeset odf-localvolumeset -n openshift-local-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+
+# Delete lingering local PVs
+for pv in $(oc get pv -l storage.openshift.com/local-volume-owner-name=odf-localvolumeset -o jsonpath='{.items[*].metadata.name}'); do
+  oc patch pv "$pv" --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  oc delete pv "$pv"
+done
+```
+
+#### 5. Uninstall Local Storage Operator
+```bash
+oc delete subscription local-storage-operator -n openshift-local-storage
+for csv in $(oc get csv -n openshift-local-storage -o jsonpath='{.items[*].metadata.name}'); do
+  oc delete csv "$csv" -n openshift-local-storage
+done
+oc delete operatorgroup local-operator-group -n openshift-local-storage
+```
+
+#### 6. Delete Storage Namespaces
+```bash
+oc delete ns openshift-storage openshift-local-storage --wait=false
+```
+
+#### 7. Wipe Disks and Host Directories on All Nodes
+Run the following wipe sequence across every storage node (`master-0`, `master-1`, `master-2`):
+
+```bash
+for node in $(oc get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  echo "=== Wiping storage on $node ==="
+  oc debug "node/${node}" -- chroot /host /bin/bash -c '
+    # Wipe the 100 GB EBS disk (/dev/nvme1n1)
+    if [ -b "/dev/nvme1n1" ]; then
+      sgdisk --zap-all /dev/nvme1n1
+      wipefs -a -f /dev/nvme1n1
+      dd if=/dev/zero of=/dev/nvme1n1 bs=1M count=100 oflag=direct
+    fi
+    # Delete host rook data directory
+    rm -rf /var/lib/rook/*
+  '
+done
+```
+
+---
+
+### Step-by-Step Reinstallation Procedure
+
+Once the teardown and wiping steps above are finished, the cluster is in a clean baseline state. Follow the standard installation sequence:
+
+1. **Deploy Dedicated Network**:
+   ```bash
+   oc apply -f manifests/00-odf-network.yaml
+   ```
+
+2. **Deploy Local Storage Operator**:
+   ```bash
+   oc apply -f manifests/01-lso-operator.yaml
+   oc wait --for=jsonpath='{.status.phase}'=Succeeded csv -l operators.coreos.com/local-storage-operator.openshift-local-storage -n openshift-local-storage --timeout=300s
+   ```
+
+3. **Discover Disks & Create Local PVs**:
+   ```bash
+   oc apply -f manifests/02-lso-localvolumeset.yaml
+   # Verify all 3 PVs appear in Available or Released state
+   oc get pv -l storage.openshift.com/local-volume-owner-name=odf-localvolumeset
+   ```
+
+4. **Deploy ODF Operator**:
+   ```bash
+   oc apply -f manifests/03-odf-operator.yaml
+   oc wait --for=jsonpath='{.status.phase}'=Succeeded csv -l operators.coreos.com/odf-operator.openshift-storage -n openshift-storage --timeout=300s
+   ```
+
+5. **Deploy StorageCluster on `odf-network`**:
+   ```bash
+   oc apply -f manifests/04-odf-storagecluster.yaml
+   oc wait --for=jsonpath='{.status.phase}'=Ready storagecluster/ocs-storagecluster -n openshift-storage --timeout=600s
+   ```
+
+6. **Validate Deployment**:
+   ```bash
+   ./scripts/verify-odf.sh
+   ```
