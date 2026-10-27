@@ -15,8 +15,6 @@ spec:
     addressRanges:
       cluster:
         - 10.200.0.0/24
-      public:
-        - 10.128.0.0/14
   storageDeviceSets:
     - name: ocs-deviceset
       count: 1
@@ -44,6 +42,10 @@ spec:
           - key: "node-role.kubernetes.io/control-plane"
             operator: "Exists"
             effect: "NoSchedule"
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
   resources:
     mds:
       requests:

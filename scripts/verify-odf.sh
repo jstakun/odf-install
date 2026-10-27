@@ -35,16 +35,30 @@ echo "=== 5. Checking StorageClasses ==="
 oc get sc | grep -E "ocs|odf"
 echo ""
 
+wait_for_pod_completion() {
+  local pod_name="$1"
+  local ns="$2"
+  local timeout="${3:-60}"
+  local elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    phase=$(oc get pod "$pod_name" -n "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  return 1
+}
+
 echo "=== 6. Running Verification Test (RBD & CephFS) ==="
 oc apply -f "${REPO_ROOT}/manifests/05-test-pvc-rbd.yaml"
-oc wait --for=condition=Ready pod/test-rbd-pod -n default --timeout=60s || true
-sleep 5
+wait_for_pod_completion "test-rbd-pod" "default" 60 || true
 oc logs test-rbd-pod -n default
 oc delete -f "${REPO_ROOT}/manifests/05-test-pvc-rbd.yaml"
 
 oc apply -f "${REPO_ROOT}/manifests/06-test-pvc-cephfs.yaml"
-oc wait --for=condition=Ready pod/test-cephfs-pod -n default --timeout=60s || true
-sleep 5
+wait_for_pod_completion "test-cephfs-pod" "default" 60 || true
 oc logs test-cephfs-pod -n default
 oc delete -f "${REPO_ROOT}/manifests/06-test-pvc-cephfs.yaml"
 

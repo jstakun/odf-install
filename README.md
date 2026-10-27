@@ -277,10 +277,11 @@ CEPHFS TEST SUCCESS
 If you need to redeploy ODF from scratch, simply deleting the `StorageCluster` or uninstalling the operators is **insufficient**. Reinstallation requires a complete teardown and disk/node wipe:
 
 > [!CAUTION]
-> **Why Node and Disk Wiping is Mandatory Before Reinstalling:**
-> 1. **BlueStore Signatures on EBS Disks**: Ceph writes metadata and signatures to raw block devices (`/dev/nvme1n1`). If not wiped with `wipefs` and `dd`, Local Storage Operator and Rook will detect existing filesystem/partition signatures and refuse to provision PVs or OSDs on them.
-> 2. **Monitor State in `/var/lib/rook`**: Host nodes retain Ceph monitor maps, keys, and old cluster FSIDs in `/var/lib/rook`. If this directory is not deleted, newly deployed MONs will attempt to join the old non-existent cluster and fail quorum.
-> 3. **Kubernetes Finalizers**: Resources such as `StorageCluster`, `CephCluster`, and `NooBaa` often block namespace deletion if daemons are terminated unexpectedly.
+> **Why Node, Disk, and CR Wiping is Mandatory Before Reinstalling:**
+> 1. **Ceph BlueStore Signatures on EBS Disks**: Ceph writes proprietary metadata and signatures across raw block devices (`/dev/nvme1n1`). Standard `wipefs` and simple `dd` do not clear all internal BlueStore superblocks. OSD prepare jobs will detect previous metadata and fail with `belonging to a different ceph cluster`. Reliable removal requires `ceph-volume lvm zap --destroy <dev>` inside the cached RHCeph container.
+> 2. **Cluster-Scoped `StorageClient` Resource**: In ODF 4.16+ / 4.22, the internal architecture uses a client-provider model. The `StorageClient` custom resource (`ocs-storagecluster`) is **cluster-scoped** (non-namespaced). It holds the UUID of the internal `StorageConsumer`. If this resource is not deleted during teardown, the newly installed `ocs-client-operator` attempts to contact the old cluster UUID, failing with `rpc error: code = Internal desc = failed to get StorageConsumer`, which prevents the creation of the `ocs-storagecluster-ceph-rbd` and `ocs-storagecluster-cephfs` StorageClasses.
+> 3. **Monitor State in `/var/lib/rook`**: Host nodes retain Ceph monitor maps, keys, and old cluster FSIDs in `/var/lib/rook`. If this directory is not deleted, newly deployed MONs will attempt to join the old non-existent cluster and fail quorum.
+> 4. **Kubernetes Finalizers & Leases**: Resources such as `StorageCluster`, `CephCluster`, `NooBaa`, and CSI coordination leases block namespace deletion or stall controller leader elections if daemons are terminated unexpectedly.
 
 ---
 
@@ -335,6 +336,21 @@ for cr in noobaa backingstore bucketclass; do
     oc patch "$cr" "$res" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
   done
 done
+
+# Strip finalizers and delete cluster-scoped StorageClient
+for item in $(oc get storageclient -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+  oc patch storageclient "$item" --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  oc delete storageclient "$item" --wait=false 2>/dev/null || true
+done
+
+# Strip lingering finalizers on storage configmaps, secrets, and leases
+for res in configmaps secrets; do
+  for item in $(oc get "$res" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+    oc patch "$res" "$item" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  done
+done
+oc delete lease -n openshift-storage --all 2>/dev/null || true
+oc delete sc ocs-storagecluster-ceph-rbd ocs-storagecluster-cephfs --ignore-not-found 2>/dev/null || true
 ```
 
 #### 3. Uninstall ODF Operator
@@ -379,11 +395,20 @@ Run the following wipe sequence across every storage node (`master-0`, `master-1
 for node in $(oc get nodes -o jsonpath='{.items[*].metadata.name}'); do
   echo "=== Wiping storage on $node ==="
   oc debug "node/${node}" -- chroot /host /bin/bash -c '
-    # Wipe the 100 GB EBS disk (/dev/nvme1n1)
-    if [ -b "/dev/nvme1n1" ]; then
-      sgdisk --zap-all /dev/nvme1n1
-      wipefs -a -f /dev/nvme1n1
-      dd if=/dev/zero of=/dev/nvme1n1 bs=1M count=100 oflag=direct
+    TARGET_DEV="/dev/nvme1n1"
+    if [ -b "$TARGET_DEV" ]; then
+      # Completely zap Ceph BlueStore signatures using rhceph container
+      CEPH_IMG=$(crictl images -o json 2>/dev/null | jq -r ".images[].repoTags[]? | select(test(\"rhceph\"))" | head -n1 || true)
+      if [ -n "$CEPH_IMG" ]; then
+        podman run --rm --privileged -v /dev:/dev -v /run/udev:/run/udev "$CEPH_IMG" ceph-volume lvm zap --destroy "$TARGET_DEV" || true
+      fi
+      sgdisk --zap-all "$TARGET_DEV" || true
+      wipefs -a -f "$TARGET_DEV" || true
+      dd if=/dev/zero of="$TARGET_DEV" bs=1M count=100 oflag=direct status=none || true
+      DEV_BLOCKS=$(blockdev --getsz "$TARGET_DEV" 2>/dev/null || echo 0)
+      if [ "$DEV_BLOCKS" -gt 204800 ]; then
+        dd if=/dev/zero of="$TARGET_DEV" bs=512 seek=$((DEV_BLOCKS - 204800)) count=204800 oflag=direct status=none || true
+      fi
     fi
     # Delete host rook data directory
     rm -rf /var/lib/rook/*

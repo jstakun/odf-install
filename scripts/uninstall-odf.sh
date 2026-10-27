@@ -61,6 +61,13 @@ for cr in noobaa backingstore bucketclass; do
   done
 done
 
+# Remove finalizers on cluster-scoped StorageClient and delete it
+for item in $(oc get storageclient -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+  echo "Removing finalizers and deleting StorageClient $item..."
+  oc patch storageclient "$item" --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+  oc delete storageclient "$item" --wait=false 2>/dev/null || true
+done
+
 # Remove finalizers on dependent Ceph and CSI-Addons resources
 for crd in clientprofiles.csi.ceph.io csiaddonsnodes.csiaddons.openshift.io storageconsumers.ocs.openshift.io cephblockpools.ceph.rook.io cephfilesystems.ceph.rook.io cephblockpoolradosnamespaces.ceph.rook.io cephfilesystemsubvolumegroups.ceph.rook.io cephclients.ceph.rook.io; do
   for item in $(oc get "$crd" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
@@ -69,12 +76,13 @@ for crd in clientprofiles.csi.ceph.io csiaddonsnodes.csiaddons.openshift.io stor
   done
 done
 
-# Strip lingering finalizers on storage configmaps and secrets
+# Strip lingering finalizers on storage configmaps, secrets, and leases
 for res in configmaps secrets; do
   for item in $(oc get "$res" -n openshift-storage -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
     oc patch "$res" "$item" -n openshift-storage --type=json -p '[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
   done
 done
+oc delete lease -n openshift-storage --all 2>/dev/null || true
 
 # Delete ODF storage classes
 oc delete sc ocs-storagecluster-ceph-rbd ocs-storagecluster-cephfs --ignore-not-found 2>/dev/null || true
@@ -115,26 +123,39 @@ for node in $NODES; do
   echo "--- Cleaning node: $node ---"
   oc debug "node/${node}" -- chroot /host /bin/bash -c '
     set -x
-    # Identify 100G non-root disk (nvme1n1)
-    TARGET_DEV="/dev/nvme1n1"
-    if [ -b "$TARGET_DEV" ]; then
-      DEV_SIZE=$(lsblk -b -n -o SIZE "$TARGET_DEV" | head -n1)
-      # 100 GB is approx 107374182400 bytes
-      if [ "$DEV_SIZE" -gt 90000000000 ] && [ "$DEV_SIZE" -lt 120000000000 ]; then
-        echo "Wiping $TARGET_DEV ($DEV_SIZE bytes)..."
-        sgdisk --zap-all "$TARGET_DEV" || true
-        wipefs -a -f "$TARGET_DEV" || true
-        dd if=/dev/zero of="$TARGET_DEV" bs=1M count=100 oflag=direct || true
-      else
-        echo "Skipping $TARGET_DEV: unexpected size $DEV_SIZE"
+    # Identify 100G non-root disk (nvme1n1 or sdb)
+    TARGET_DEV=""
+    for dev in /dev/nvme1n1 /dev/sdb; do
+      if [ -b "$dev" ]; then
+        DEV_SIZE=$(lsblk -b -n -o SIZE "$dev" | head -n1)
+        if [ "$DEV_SIZE" -gt 90000000000 ] && [ "$DEV_SIZE" -lt 120000000000 ]; then
+          TARGET_DEV="$dev"
+          break
+        fi
+      fi
+    done
+
+    if [ -n "$TARGET_DEV" ]; then
+      echo "Wiping $TARGET_DEV ($DEV_SIZE bytes)..."
+      
+      # Use rhceph container to completely clear Ceph BlueStore signatures
+      CEPH_IMG=$(crictl images -o json 2>/dev/null | jq -r '.images[].repoTags[]? | select(test("rhceph"))' | head -n1 || true)
+      if [ -n "$CEPH_IMG" ]; then
+        echo "Running ceph-volume lvm zap with $CEPH_IMG on $TARGET_DEV..."
+        podman run --rm --privileged -v /dev:/dev -v /run/udev:/run/udev "$CEPH_IMG" ceph-volume lvm zap --destroy "$TARGET_DEV" || true
+      fi
+
+      sgdisk --zap-all "$TARGET_DEV" || true
+      wipefs -a -f "$TARGET_DEV" || true
+      dd if=/dev/zero of="$TARGET_DEV" bs=1M count=100 oflag=direct status=none || true
+
+      # Zero end of disk where backup GPT/metadata resides
+      DEV_BLOCKS=$(blockdev --getsz "$TARGET_DEV" 2>/dev/null || echo 0)
+      if [ "$DEV_BLOCKS" -gt 204800 ]; then
+        dd if=/dev/zero of="$TARGET_DEV" bs=512 seek=$((DEV_BLOCKS - 204800)) count=204800 oflag=direct status=none || true
       fi
     else
-      echo "Device $TARGET_DEV not found, checking sdb..."
-      if [ -b "/dev/sdb" ]; then
-        sgdisk --zap-all /dev/sdb || true
-        wipefs -a -f /dev/sdb || true
-        dd if=/dev/zero of=/dev/sdb bs=1M count=100 oflag=direct || true
-      fi
+      echo "No 100G target EBS device found to wipe on this node."
     fi
 
     # Clean host data dir
