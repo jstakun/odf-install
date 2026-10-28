@@ -139,7 +139,7 @@ for node in $NODES; do
       echo "Wiping $TARGET_DEV ($DEV_SIZE bytes)..."
       
       # Use rhceph container to completely clear Ceph BlueStore signatures
-      CEPH_IMG=$(crictl images -o json 2>/dev/null | jq -r '.images[].repoTags[]? | select(test("rhceph"))' | head -n1 || true)
+      CEPH_IMG=$(podman images --format "{{.ID}} {{.Repository}}" 2>/dev/null | awk "/rhceph/ {print \$1; exit}" || true)
       if [ -n "$CEPH_IMG" ]; then
         echo "Running ceph-volume lvm zap with $CEPH_IMG on $TARGET_DEV..."
         podman run --rm --privileged -v /dev:/dev -v /run/udev:/run/udev "$CEPH_IMG" ceph-volume lvm zap --destroy "$TARGET_DEV" || true
@@ -149,10 +149,11 @@ for node in $NODES; do
       wipefs -a -f "$TARGET_DEV" || true
       dd if=/dev/zero of="$TARGET_DEV" bs=1M count=100 oflag=direct status=none || true
 
-      # Zero end of disk where backup GPT/metadata resides
+      # Zero end of disk (last 100MB) where backup GPT/metadata resides
       DEV_BLOCKS=$(blockdev --getsz "$TARGET_DEV" 2>/dev/null || echo 0)
       if [ "$DEV_BLOCKS" -gt 204800 ]; then
-        dd if=/dev/zero of="$TARGET_DEV" bs=512 seek=$((DEV_BLOCKS - 204800)) count=204800 oflag=direct status=none || true
+        DEV_SIZE_MB=$((DEV_BLOCKS / 2048))
+        dd if=/dev/zero of="$TARGET_DEV" bs=1M seek=$((DEV_SIZE_MB - 100)) count=100 oflag=direct status=none || true
       fi
     else
       echo "No 100G target EBS device found to wipe on this node."
